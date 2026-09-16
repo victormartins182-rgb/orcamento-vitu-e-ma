@@ -209,6 +209,8 @@
   .carteira-balance{font-size:15px;font-weight:700;font-family:'Sora',sans-serif;}
   .rent-pill{font-size:11px;font-weight:700;margin-top:2px;}
 </style>
+<script src="https://www.gstatic.com/firebasejs/10.13.0/firebase-app-compat.js"></script>
+<script src="https://www.gstatic.com/firebasejs/10.13.0/firebase-firestore-compat.js"></script>
 </head>
 <body>
 <div id="app"></div>
@@ -243,6 +245,19 @@ const DEFAULT_VARS = [
   { id:"mercado_marcela",  label:"🛍️ Mercado / Saídas Marcela",  budget:700,  group:"swile" },
 ];
 const STORAGE_KEY = "orcamento_casal_v4";
+const SYNC_CODE_KEY = "orcamento_sync_code_v1";
+
+const firebaseConfig = {
+  apiKey: "AIzaSyAirq4uwT0E6tJHLDIBZNldDAwFQyWfMh0",
+  authDomain: "orcamentovictormarcela.firebaseapp.com",
+  projectId: "orcamentovictormarcela",
+  storageBucket: "orcamentovictormarcela.firebasestorage.app",
+  messagingSenderId: "509688208570",
+  appId: "1:509688208570:web:2e395f701191a40027f683"
+};
+let fbApp=null, fbDb=null, fbUnsub=null;
+const CLIENT_ID = Math.random().toString(36).slice(2)+Date.now().toString(36);
+const SYNC_FIELDS = ["fixos","vars","entries","paid","incomeItems","goals","patrimonio","monthlyHistory","orcamentoOverride","appName","periodStartDay"];
 
 let state = {
   fixos: JSON.parse(JSON.stringify(DEFAULT_FIXOS)),
@@ -266,6 +281,8 @@ let state = {
   theme: { gold: "#e8b84b", wealth: "#7dd3fc" },
   addingCarteira: false, editingCarteiraMeta: null, expandedCarteiraHistory: null,
   expandedCategory: null,
+  pendingEntry: null,
+  syncCode: null, syncStatus: 'offline', showSyncSetup: null,
 };
 function defaultCarteiras(){
   return [
@@ -315,8 +332,113 @@ function loadState() {
 }
 function saveState() {
   try { localStorage.setItem(STORAGE_KEY, JSON.stringify({fixos:state.fixos,vars:state.vars,entries:state.entries,paid:state.paid,incomeItems:state.incomeItems,goals:state.goals,patrimonio:state.patrimonio,orcamentoOverride:state.orcamentoOverride,appName:state.appName,periodStartDay:state.periodStartDay,pinEnabled:state.pinEnabled,pinHash:state.pinHash,readOnlyMode:state.readOnlyMode,theme:state.theme})); } catch(e) {}
+  schedulePush();
 }
-function saveMonthlyHistory(){ try{ localStorage.setItem('monthly_history_v1', JSON.stringify(state.monthlyHistory)); }catch(e){} }
+function saveMonthlyHistory(){ try{ localStorage.setItem('monthly_history_v1', JSON.stringify(state.monthlyHistory)); }catch(e){} schedulePush(); }
+
+// ─── SINCRONIZAÇÃO EM NUVEM (Firestore) ────────────────────────
+function getSyncCode(){ try{ return localStorage.getItem(SYNC_CODE_KEY); }catch(e){ return null; } }
+function persistSyncCode(code){ try{ if(code) localStorage.setItem(SYNC_CODE_KEY, code); else localStorage.removeItem(SYNC_CODE_KEY); }catch(e){} }
+function initFirebase(){
+  if(fbApp) return true;
+  try{
+    if(typeof firebase==='undefined') return false;
+    fbApp = firebase.initializeApp(firebaseConfig);
+    fbDb = firebase.firestore();
+    return true;
+  }catch(e){ console.error('Firebase init failed', e); return false; }
+}
+function generateSyncCode(){
+  const chars='ABCDEFGHJKLMNPQRSTUVWXYZ23456789';
+  let out='';
+  for(let i=0;i<6;i++) out+=chars[Math.floor(Math.random()*chars.length)];
+  return out;
+}
+function buildSyncPayload(){
+  const data={}; SYNC_FIELDS.forEach(k=>data[k]=state[k]);
+  data._lastEditedBy=CLIENT_ID; data._updatedAt=Date.now();
+  return data;
+}
+function applySyncPayload(data){
+  SYNC_FIELDS.forEach(k=>{ if(data[k]!==undefined) state[k]=data[k]; });
+  try { localStorage.setItem(STORAGE_KEY, JSON.stringify({fixos:state.fixos,vars:state.vars,entries:state.entries,paid:state.paid,incomeItems:state.incomeItems,goals:state.goals,patrimonio:state.patrimonio,orcamentoOverride:state.orcamentoOverride,appName:state.appName,periodStartDay:state.periodStartDay,pinEnabled:state.pinEnabled,pinHash:state.pinHash,readOnlyMode:state.readOnlyMode,theme:state.theme})); } catch(e) {}
+  try { localStorage.setItem('monthly_history_v1', JSON.stringify(state.monthlyHistory)); } catch(e) {}
+}
+let pushTimer=null;
+function schedulePush(){
+  if(!state.syncCode || !fbDb) return;
+  clearTimeout(pushTimer);
+  pushTimer=setTimeout(()=>{
+    fbDb.collection('orcamentos').doc(state.syncCode).set(buildSyncPayload(),{merge:true})
+      .then(()=>{ state.syncStatus='synced'; render(); })
+      .catch((e)=>{ console.error('push failed',e); state.syncStatus='error'; render(); });
+  }, 500);
+}
+function attachSyncListener(){
+  if(fbUnsub) fbUnsub();
+  fbUnsub=fbDb.collection('orcamentos').doc(state.syncCode).onSnapshot(snap=>{
+    if(!snap.exists) return;
+    const data=snap.data();
+    if(data._lastEditedBy===CLIENT_ID) { state.syncStatus='synced'; render(); return; }
+    applySyncPayload(data);
+    state.syncStatus='synced';
+    document.title="Orçamento — "+state.appName;
+    applyTheme();
+    showFeedback('ok','☁️ Atualizado por sincronização');
+    render();
+  }, err=>{ console.error('sync listener error', err); state.syncStatus='error'; render(); });
+}
+function connectSync(code){
+  if(isReadOnly()){showFeedback('warn','👁️ Modo demonstração: edição desativada.');return;}
+  if(!initFirebase()){ showFeedback('err','Não consegui conectar ao Firebase.'); return; }
+  state.syncStatus='connecting'; render();
+  const ref=fbDb.collection('orcamentos').doc(code);
+  ref.get().then(snap=>{
+    if(snap.exists){ applySyncPayload(snap.data()); }
+    state.syncCode=code;
+    persistSyncCode(code);
+    state.showSyncSetup=null;
+    attachSyncListener();
+    schedulePush();
+    state.syncStatus='synced';
+    document.title="Orçamento — "+state.appName;
+    applyTheme();
+    showFeedback('ok', snap.exists? '☁️ Conectado! Dados sincronizados.' : '☁️ Código criado e conectado.');
+    render();
+  }).catch(e=>{
+    console.error(e); state.syncStatus='error';
+    showFeedback('err','Erro ao conectar. Confira sua internet e tente de novo.');
+    render();
+  });
+}
+function disconnectSync(){
+  if(isReadOnly()){showFeedback('warn','👁️ Modo demonstração: edição desativada.');return;}
+  if(!confirm('Desconectar a sincronização? Os dados continuam salvos neste celular, mas param de se atualizar com o outro aparelho.'))return;
+  if(fbUnsub){ fbUnsub(); fbUnsub=null; }
+  state.syncCode=null; persistSyncCode(null); state.syncStatus='offline';
+  saveState(); render();
+}
+function openSyncCreate(){ state.showSyncSetup='create'; render(); }
+function openSyncJoin(){ state.showSyncSetup='join'; render(); }
+function cancelSyncSetup(){ state.showSyncSetup=null; render(); }
+function confirmSyncCreate(){
+  if(isReadOnly()){showFeedback('warn','👁️ Modo demonstração: edição desativada.');return;} connectSync(generateSyncCode()); }
+function confirmSyncJoin(){
+  if(isReadOnly()){showFeedback('warn','👁️ Modo demonstração: edição desativada.');return;}
+  const el=document.getElementById('joinSyncInput');
+  const code=(el?el.value:'').trim().toUpperCase();
+  if(!/^[A-Z0-9]{4,10}$/.test(code)){ showFeedback('err','Digite o código que a outra pessoa te passou.'); return; }
+  connectSync(code);
+}
+function reconnectSync(){
+  const code=getSyncCode();
+  if(!code) return;
+  if(!initFirebase()){ state.syncStatus='error'; return; }
+  state.syncCode=code;
+  state.syncStatus='connecting';
+  attachSyncListener();
+}
+
 function fmtBRL(v) { return Number(v||0).toLocaleString("pt-BR",{style:"currency",currency:"BRL"}); }
 function getCurrentPeriod() {
   const now=new Date(), day=now.getDate(), m=now.getMonth(), y=now.getFullYear();
@@ -339,7 +461,7 @@ function parseCat(text) {
   }
   const map=[
     {id:"mercado",      k:["mercado","feira","supermercado","hortifruti","carrefour","pao de acucar"]},
-    {id:"restaurantes", k:["restaurante","delivery","pizza","ifood","refeicao","comida","rappi"]},
+    {id:"restaurantes", k:["restaurante","delivery","pizza","ifood","refeicao","comida","rappi","jantar","janta","hamburgueria","hamburguer","burguer","lanche","bar do","boteco"]},
     {id:"roupas",       k:["roupa","vestuario","tenis","sapato","calcado","zara","renner"]},
     {id:"lazer",        k:["lazer","passeio","cinema","show","viagem","parque","bar","balada"]},
     {id:"farmacia",     k:["farmacia","remedio","saude","medico","consulta","exame","drogasil"]},
@@ -378,11 +500,29 @@ function handleNatural() {
   if(!amt&&!cat){showFeedback("err","Não entendi. Tente: 'gastei 150 no mercado'");return;}
   if(cat&&isFixed(cat)){state.paid[cat]=true;saveState();showFeedback("ok","✅ "+getCatLabel(cat)+" marcado como pago");el.value="";render();return;}
   if(!amt){showFeedback("err","Não identifiquei o valor.");return;}
-  if(!cat){showFeedback("warn","Categoria não reconhecida. Use a aba Manual.");return;}
+  if(!cat){
+    state.pendingEntry={amt,description:text};
+    el.value="";
+    render();
+    return;
+  }
   const v=state.vars.find(c=>c.id===cat);
   state.entries.unshift({id:Date.now(),catId:cat,catLabel:v?v.label:cat,amount:amt,description:text,date:new Date().toISOString()});
   saveState(); showFeedback("ok","✅ "+fmtBRL(amt)+" em "+(v?v.label:cat));
   el.value=""; render();
+}
+function cancelPendingEntry(){ state.pendingEntry=null; render(); }
+function confirmPendingEntry(){
+  if(isReadOnly()){showFeedback('warn','👁️ Modo demonstração: edição desativada.');return;}
+  const catId=(document.getElementById('pendingCatSelect')||{value:''}).value;
+  if(!catId){showFeedback('err','Selecione uma categoria.');return;}
+  const v=state.vars.find(c=>c.id===catId);
+  const {amt,description}=state.pendingEntry;
+  state.entries.unshift({id:Date.now(),catId,catLabel:v?v.label:catId,amount:amt,description,date:new Date().toISOString()});
+  state.pendingEntry=null;
+  saveState();
+  showFeedback('ok','✅ '+fmtBRL(amt)+' em '+(v?v.label:catId));
+  render();
 }
 
 function togglePaid(id){
@@ -859,6 +999,7 @@ function render(){
       </div>
       <div style="display:flex;flex-direction:column;align-items:flex-end;gap:6px">
         <div class="header-badge">${resultado>=0?'✅ no azul':'⚠️ no vermelho'}</div>
+        ${state.syncCode?`<div class="header-badge" style="color:${state.syncStatus==='synced'?'var(--wealth)':state.syncStatus==='error'?'var(--red)':'var(--warn)'}">${state.syncStatus==='synced'?'☁️ sincronizado':state.syncStatus==='connecting'?'☁️ conectando…':'☁️ erro'}</div>`:''}
         <button onclick="toggleSettings()" style="background:var(--surface-3);border:1px solid var(--border);color:var(--text-dim);border-radius:8px;width:26px;height:26px;font-size:13px;cursor:pointer">⚙️</button>
       </div>
     </div>
@@ -873,6 +1014,38 @@ function render(){
       <div style="display:flex;gap:8px;margin-top:2px">
         <button class="btn-submit ghost" style="margin-top:0" onclick="state.showSettings=false;render()">Cancelar</button>
         <button class="btn-submit" style="margin-top:0" onclick="saveSettings()">Salvar</button>
+      </div>
+
+      <div style="margin-top:18px;padding-top:14px;border-top:1px solid var(--border-soft)">
+        <div class="chart-title" style="margin-bottom:10px">☁️ Sincronização em nuvem</div>
+        ${state.syncCode ? `
+          <div style="font-size:11.5px;margin-bottom:9px;color:${state.syncStatus==='synced'?'var(--wealth)':state.syncStatus==='error'?'var(--red)':'var(--warn)'}">${state.syncStatus==='synced'?'🟢 Sincronizado — atualiza em tempo real':state.syncStatus==='connecting'?'🟡 Conectando…':'🔴 Erro de conexão'}</div>
+          <div style="background:#0e111c;border-radius:9px;padding:11px 13px;display:flex;justify-content:space-between;align-items:center;margin-bottom:9px">
+            <div><div style="font-size:9.5px;color:var(--text-faint);text-transform:uppercase;letter-spacing:1px">Código do casal</div>
+            <div style="font-size:17px;font-weight:800;font-family:'Sora',sans-serif;letter-spacing:2px;color:var(--wealth)">${state.syncCode}</div></div>
+            <button onclick="navigator.clipboard&&navigator.clipboard.writeText('${state.syncCode}');showFeedback('ok','Código copiado')" style="background:var(--surface-3);border:1px solid var(--border);color:var(--text-dim);border-radius:7px;padding:7px 11px;font-size:11px;cursor:pointer">Copiar</button>
+          </div>
+          <div style="font-size:10.5px;color:var(--text-faint);margin-bottom:9px;line-height:1.5">Compartilhe esse código com a Marcela — ela digita em "Já tenho um código" no celular dela e os dois ficam sincronizados.</div>
+          <button onclick="disconnectSync()" style="width:100%;background:transparent;border:1px solid rgba(247,106,106,.3);color:var(--red);border-radius:var(--radius-sm);padding:10px;cursor:pointer;font-size:12px;font-family:inherit;font-weight:600">Desconectar sincronização</button>
+        ` : (state.showSyncSetup ? `
+          ${state.showSyncSetup==='create' ? `
+            <div style="font-size:11.5px;color:var(--text-dim);margin-bottom:10px;line-height:1.5">Vou gerar um código único. Depois é só compartilhar com a Marcela pra ela entrar com ele no celular dela.</div>
+          ` : `
+            <div class="form-group"><label class="form-label">Código recebido</label>
+              <input id="joinSyncInput" class="form-input" placeholder="Ex: 7K3XQ9" style="text-transform:uppercase;letter-spacing:2px" onkeydown="if(event.key==='Enter')confirmSyncJoin()"/>
+            </div>
+          `}
+          <div style="display:flex;gap:8px">
+            <button class="btn-submit ghost" style="margin-top:0" onclick="cancelSyncSetup()">Cancelar</button>
+            <button class="btn-submit" style="margin-top:0" onclick="${state.showSyncSetup==='create'?'confirmSyncCreate()':'confirmSyncJoin()'}">${state.showSyncSetup==='create'?'Gerar código':'Conectar'}</button>
+          </div>
+        ` : `
+          <div style="font-size:11.5px;color:var(--text-faint);margin-bottom:10px;line-height:1.5">Sincronize com a Marcela: os dois acessam o mesmo orçamento, em tempo real, em qualquer celular.</div>
+          <div style="display:flex;gap:8px">
+            <button class="btn-submit ghost" style="margin-top:0" onclick="openSyncCreate()">Criar código novo</button>
+            <button class="btn-submit" style="margin-top:0" onclick="openSyncJoin()">Já tenho um código</button>
+          </div>
+        `)}
       </div>
 
       <div style="margin-top:18px;padding-top:14px;border-top:1px solid var(--border-soft)">
@@ -951,10 +1124,22 @@ function render(){
   <div class="input-box"><div class="input-inner">
     <div class="input-label">Lançamento rápido</div>
     <div class="input-row">
-      <input id="natInput" placeholder='"gastei 150 no mercado" ou "paguei aluguel"' onkeydown="if(event.key==='Enter')handleNatural()"/>
+      <input id="natInput" placeholder='"150 jantar Real Burguer com Vinicius"' onkeydown="if(event.key==='Enter')handleNatural()"/>
       <button class="btn-add" onclick="handleNatural()">+</button>
     </div>
     ${state.feedback?`<div class="feedback fb-${state.feedback.type}">${state.feedback.msg}</div>`:""}
+    ${state.pendingEntry?`<div style="margin-top:10px;padding:11px;background:#0e111c;border:1px solid var(--gold);border-radius:9px">
+      <div style="font-size:11.5px;color:var(--text-dim);margin-bottom:8px">Não reconheci a categoria de "<b style="color:var(--text)">${state.pendingEntry.description}</b>" (${fmtBRL(state.pendingEntry.amt)}). Qual é?</div>
+      <select id="pendingCatSelect" class="form-input" style="margin-bottom:8px">
+        <option value="">Selecione...</option>
+        <optgroup label="── Itaú Variáveis">${state.vars.filter(v=>v.group==="itau").map(v=>`<option value="${v.id}">${v.label}</option>`).join("")}</optgroup>
+        <optgroup label="── Swile">${state.vars.filter(v=>v.group==="swile").map(v=>`<option value="${v.id}">${v.label}</option>`).join("")}</optgroup>
+      </select>
+      <div style="display:flex;gap:8px">
+        <button class="patri-cancel" style="flex:1;border:none;border-radius:9px;padding:9px;font-weight:800;font-size:12px;cursor:pointer;font-family:'Sora',sans-serif" onclick="cancelPendingEntry()">Cancelar</button>
+        <button class="patri-confirm" style="flex:1;border:none;border-radius:9px;padding:9px;font-weight:800;font-size:12px;cursor:pointer;font-family:'Sora',sans-serif" onclick="confirmPendingEntry()">Confirmar</button>
+      </div>
+    </div>`:''}
   </div></div>
   <div class="tabs">
     ${[["resumo","Resumo"],["fixos","Fixos"],["variaveis","Variáveis"],["metas","Metas"],["patrimonio","Patrimônio"],["manual","Manual"],["historico","Histórico"]].map(([t,l])=>
@@ -1452,6 +1637,7 @@ document.title="Orçamento — "+state.appName;
 applyTheme();
 state.unlocked = !state.pinEnabled;
 render();
+reconnectSync();
 </script>
 </body>
 </html>
