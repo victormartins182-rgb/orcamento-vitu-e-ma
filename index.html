@@ -418,9 +418,9 @@ function disconnectSync(){
   state.syncCode=null; persistSyncCode(null); state.syncStatus='offline';
   saveState(); render();
 }
-function openSyncCreate(){ state.showSyncSetup='create'; render(); }
-function openSyncJoin(){ state.showSyncSetup='join'; render(); }
-function cancelSyncSetup(){ state.showSyncSetup=null; render(); }
+function openSyncCreate(){ state.showSyncSetup='create'; state.syncStatus='offline'; render(); }
+function openSyncJoin(){ state.showSyncSetup='join'; state.syncStatus='offline'; render(); }
+function cancelSyncSetup(){ state.showSyncSetup=null; state.syncStatus='offline'; render(); }
 function confirmSyncCreate(){
   if(isReadOnly()){showFeedback('warn','👁️ Modo demonstração: edição desativada.');return;} connectSync(generateSyncCode()); }
 function confirmSyncJoin(){
@@ -1035,6 +1035,8 @@ function render(){
               <input id="joinSyncInput" class="form-input" placeholder="Ex: 7K3XQ9" style="text-transform:uppercase;letter-spacing:2px" onkeydown="if(event.key==='Enter')confirmSyncJoin()"/>
             </div>
           `}
+          ${state.syncStatus==='connecting'?`<div style="font-size:11px;color:var(--warn);margin-bottom:8px">🟡 Conectando…</div>`:''}
+          ${state.syncStatus==='error'?`<div style="font-size:11px;color:var(--red);margin-bottom:8px;line-height:1.5">🔴 Não consegui conectar. O motivo mais comum é o Firestore estar com as regras de segurança padrão (bloqueiam tudo). Veja "Regras do Firestore" no Firebase Console → Firestore Database → aba Regras.</div>`:''}
           <div style="display:flex;gap:8px">
             <button class="btn-submit ghost" style="margin-top:0" onclick="cancelSyncSetup()">Cancelar</button>
             <button class="btn-submit" style="margin-top:0" onclick="${state.showSyncSetup==='create'?'confirmSyncCreate()':'confirmSyncJoin()'}">${state.showSyncSetup==='create'?'Gerar código':'Conectar'}</button>
